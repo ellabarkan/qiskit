@@ -481,6 +481,19 @@ impl TwoQubitWeylDecomposition {
     ) -> PyResult<Self> {
         let mut u = ndarray_to_matrix4(unitary_matrix);
         let det_u = u.determinant();
+        if !det_u.re.is_finite() || !det_u.im.is_finite() || det_u.norm() < 1.0e-10 {
+            // A (near-)zero determinant means the input isn't actually
+            // unitary (e.g. it's singular), so `det_u.powf(-0.25)` below
+            // would blow up to infinity/NaN and poison every downstream
+            // computation with garbage that isn't caught by the diagonalize
+            // trial loop's reconstruction-error check (`f64::max` treats NaN
+            // as smaller than any real number, so an all-NaN residual is
+            // silently scored as a perfect 0.0 match). Fail loudly here
+            // instead, before that garbage can propagate.
+            return Err(QiskitError::new_err(format!(
+                "TwoQubitWeylDecomposition: failed to diagonalize M2. Please report this at https://github.com/Qiskit/qiskit-terra/issues/4159. Input: {unitary_matrix:?}"
+            )));
+        }
         let det_pow = det_u.powf(-0.25);
         u *= det_pow;
         let mut global_phase = det_u.arg() / 4.;
@@ -503,6 +516,21 @@ impl TwoQubitWeylDecomposition {
         let mut found = false;
         let mut d: Vector4<Complex64> = Vector4::zeros();
         let mut p: Matrix4<Complex64> = Matrix4::zeros();
+        // Track the lowest-residual (P, D) seen across all trials. Near a
+        // genuinely degenerate point of the Weyl chamber (see the
+        // specialization loci below), M2's eigenvalues can be degenerate to
+        // within numerical noise, and no amount of random real-linear
+        // mixing of A and B is guaranteed to land a reconstruction under
+        // the very tight `1e-13` absolute bound used to accept a trial.
+        // Rather than hard-failing in that case, fall back to the best
+        // candidate found and let it be judged by the fidelity check
+        // against `requested_fidelity` below -- which is the actual
+        // correctness criterion callers care about, and which already
+        // tolerates far more error (`DEFAULT_FIDELITY = 1 - 1e-9`) than the
+        // internal `1e-13` diagonalization gate.
+        let mut best_err = f64::INFINITY;
+        let mut best_p: Matrix4<Complex64> = Matrix4::zeros();
+        let mut best_d: Vector4<Complex64> = Vector4::zeros();
         for i in 0..100 {
             let rand_a: f64;
             let rand_b: f64;
@@ -530,6 +558,20 @@ impl TwoQubitWeylDecomposition {
 
             let compare = p_inner * diag_d * p_inner.transpose();
             found = abs_diff_eq!(compare, m2, epsilon = 1.0e-13);
+            // NB: `f64::max` treats NaN as "smaller" than any real number
+            // and returns the other argument, so a fold seeded at 0.0 would
+            // silently score an all-NaN residual as a perfect 0.0 match.
+            // Guard explicitly so NaN residuals are scored as unusably bad
+            // instead of unusably good.
+            let err = (compare - m2)
+                .iter()
+                .map(|c| c.norm())
+                .fold(0.0_f64, |acc, x| if x.is_nan() { f64::INFINITY } else { acc.max(x) });
+            if err < best_err {
+                best_err = err;
+                best_p = p_inner;
+                best_d = d_inner;
+            }
             if found {
                 p = p_inner;
                 d = d_inner;
@@ -537,9 +579,21 @@ impl TwoQubitWeylDecomposition {
             }
         }
         if !found {
-            return Err(QiskitError::new_err(format!(
-                "TwoQubitWeylDecomposition: failed to diagonalize M2. Please report this at https://github.com/Qiskit/qiskit-terra/issues/4159. Input: {unitary_matrix:?}"
-            )));
+            // Only fall back to the best candidate if it's actually usable.
+            // If every trial produced a non-finite residual (e.g. because
+            // the input wasn't unitary to begin with, so `det_u.powf(-0.25)`
+            // and everything downstream is NaN/infinite), falling back would
+            // just replace this clean error with a much more confusing
+            // panic later on (e.g. `arg_sort`'s `partial_cmp().unwrap()`
+            // when comparing NaNs). In that case, keep failing loudly here.
+            if best_err.is_finite() {
+                p = best_p;
+                d = best_d;
+            } else {
+                return Err(QiskitError::new_err(format!(
+                    "TwoQubitWeylDecomposition: failed to diagonalize M2. Please report this at https://github.com/Qiskit/qiskit-terra/issues/4159. Input: {unitary_matrix:?}"
+                )));
+            }
         }
         let mut d = -d.map(|x| x.arg() / 2.);
         d[3] = -d[0] - d[1] - d[2];
