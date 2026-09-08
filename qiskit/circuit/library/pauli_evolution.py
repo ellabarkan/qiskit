@@ -389,10 +389,15 @@ def _get_default_label(operator):
 
 
 def _merge_two_pauli_evolutions(
-    gate1: PauliEvolutionGate, gate2: PauliEvolutionGate
+    gate1: PauliEvolutionGate, gate2: PauliEvolutionGate, tol: float = 0.0
 ) -> PauliEvolutionGate | None:
     """
     Attempts to merge two PauliEvolutionGates can be merged.
+
+    Args:
+        gate1: first gate.
+        gate2: second gate.
+        tol: allowed error budget for the merge (default 0.0, i.e. exact merge only).
 
     Returns:
 
@@ -408,10 +413,30 @@ def _merge_two_pauli_evolutions(
         gate2.operator, SparseObservable
     ):
         # When both operators are SparseObservables, we can compare their canonical representatives.
+        # SparseObservable comparison stays exact-only for now; tol isn't applied here.
         can_merge = gate1.operator.simplify() == gate2.operator.simplify()
+
     elif isinstance(gate1.operator, SparsePauliOp) and isinstance(gate2.operator, SparsePauliOp):
-        # SparsePauliOp already has a function that compares canonical representatives.
-        can_merge = gate1.operator.equiv(gate2.operator)
+        try:
+            t1 = float(gate1.time)
+            t2 = float(gate2.time)
+        except TypeError:
+            t1 = t2 = None
+
+        # atol=0, rtol=0: simplify()'s own default would hide the exact
+        # small differences we're trying to catch.
+        diff = (gate1.operator - gate2.operator).simplify(atol=0, rtol=0)
+        coef_diff = float(np.sum(np.abs(diff.coeffs)))
+        if t1 is None or t2 is None:
+            # No numeric time to scale by; just compare the Hamiltonians directly.
+            can_merge = coef_diff <= tol
+        else:
+            # Merge error grows with time: evolving under two slightly
+            # different H's for t1+t2 total drifts from a single merged H by
+            # roughly (t1+t2) * ||H1-H2||.
+            phase_error = (abs(t1) + abs(t2)) * coef_diff
+            can_merge = phase_error <= tol
+
     else:
         can_merge = gate1.operator == gate2.operator
 
