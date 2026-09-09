@@ -417,20 +417,23 @@ def _merge_two_pauli_evolutions(
         can_merge = gate1.operator.simplify() == gate2.operator.simplify()
 
     elif isinstance(gate1.operator, SparsePauliOp) and isinstance(gate2.operator, SparsePauliOp):
+
         try:
             t1 = float(gate1.time)
             t2 = float(gate2.time)
         except TypeError:
             t1 = t2 = None
 
-        # atol=0, rtol=0: simplify()'s own default would hide the exact
-        # small differences we're trying to catch.
-        diff = (gate1.operator - gate2.operator).simplify(atol=0, rtol=0)
-        coef_diff = float(np.sum(np.abs(diff.coeffs)))
         if t1 is None or t2 is None:
             # No numeric time to scale by; just compare the Hamiltonians directly.
-            can_merge = coef_diff <= tol
+            # Note: equiv() calls to simplify() w/o arguments, and it is using it's own tolerance 1e-8
+            can_merge = gate1.operator.equiv(gate2.operator, atol=tol)
         else:
+            # atol=0, rtol=0: simplify()'s own default would hide the exact
+            # small differences we're trying to catch.
+            diff = (gate1.operator - gate2.operator).simplify(atol=0, rtol=0)
+            coef_diff = float(np.sum(np.abs(diff.coeffs)))
+
             # Merge error grows with time: evolving under two slightly
             # different H's for t1+t2 total drifts from a single merged H by
             # roughly (t1+t2) * ||H1-H2||.
